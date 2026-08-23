@@ -3,6 +3,10 @@ const express = require("express");
 const cors = require("cors");
 const { AccessToken } = require("livekit-server-sdk");
 const { createClient } = require("@supabase/supabase-js");
+const {
+  initTimeTrackerSync,
+  handleManualSync,
+} = require("./timeTrackerSync");
 
 const app = express();
 app.use(cors());
@@ -12,6 +16,10 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
+
+// Time-tracker sync engine (Wakatime/Hackatime): manual endpoint + daily cron.
+initTimeTrackerSync(supabase);
+app.post("/sync-time-trackers", handleManualSync);
 
 const PORT = 3000;
 
