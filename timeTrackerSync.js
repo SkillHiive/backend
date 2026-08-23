@@ -7,11 +7,6 @@
 //
 // Replaces the hosted-Supabase Edge Function variant for self-hosted deploys.
 
-const PROVIDER_BASE_URLS = {
-  wakatime: "https://wakatime.com/api/v1",
-  hackatime: "https://hackatime.hackclub.com/api/v1",
-};
-
 const LOOKBACK_DAYS = 90;
 const MANUAL_DEBOUNCE_MS = 5 * 60 * 1000;
 const CRON_HOUR_UTC = 3;
@@ -36,34 +31,71 @@ function initTimeTrackerSync(adminClient) {
   }, 60 * 1000);
 }
 
-// ── Unified tracker client (both providers are Wakatime-compatible) ─────────
+// ── Unified tracker client ──────────────────────────────────────────────────
+//
+// The providers differ in auth scheme AND route layout (verified live):
+//   Wakatime  https://wakatime.com/api/v1
+//               auth: Basic base64(api_key)
+//               /users/current · /users/current/projects
+//               /users/current/summaries · /users/current/all_time_since_today
+//   Hackatime compat layer  https://hackatime.hackclub.com/api/hackatime/v1
+//               auth: Bearer api_key (Basic tried as legacy fallback)
+//               /users/current · /users/current/summaries   (nothing else)
+//   Hackatime native        https://hackatime.hackclub.com/api/v1
+//               /authenticated/projects                     (project listing)
+//
+// No all-time-per-project endpoint exists on Hackatime, so totals there are
+// derived from the 90-day summaries (fetchProject already handles that).
+
+const WAKATIME_BASE = "https://wakatime.com/api/v1";
+const HACKATIME_COMPAT_BASE = "https://hackatime.hackclub.com/api/hackatime/v1";
+const HACKATIME_NATIVE_BASE = "https://hackatime.hackclub.com/api/v1";
 
 class TimeTrackerClient {
   constructor(provider, apiKey) {
-    this.base = PROVIDER_BASE_URLS[provider] ?? PROVIDER_BASE_URLS.wakatime;
-    this.key = apiKey;
+    this.provider = provider;
+    this.schemes =
+      provider === "hackatime"
+        ? [`Bearer ${apiKey}`, `Basic ${Buffer.from(apiKey).toString("base64")}`]
+        : [`Basic ${Buffer.from(apiKey).toString("base64")}`];
+    this.resolvedScheme = null;
+    this.lastErrorDetail = null;
   }
 
   async testConnection() {
-    try {
-      const res = await this.get("/users/current");
-      return res.ok;
-    } catch {
-      return false;
-    }
+    const res = await this.get(`${this.#summariesBase()}/users/current`);
+    return res?.ok === true;
   }
 
   async listProjects() {
-    const res = await this.get("/users/current/projects");
-    if (!res.ok) return [];
-    const body = await res.json();
-    return Array.isArray(body?.data) ? body.data : [];
+    const url =
+      this.provider === "hackatime"
+        ? `${HACKATIME_NATIVE_BASE}/authenticated/projects`
+        : `${WAKATIME_BASE}/users/current/projects`;
+
+    const res = await this.get(url);
+    if (res?.ok) {
+      const body = await res.json();
+      const rows = Array.isArray(body?.data) ? body.data : [];
+      const names = rows
+        .map((row) =>
+          typeof row === "string" ? row : row?.name ?? row?.id ?? null
+        )
+        .filter(Boolean);
+      if (names.length > 0) return names;
+    }
+    // Fallback for either provider: derive active projects from summaries.
+    return this.projectNamesFromSummaries();
   }
 
   async getAllTimeSeconds(projectName) {
-    const url = `/users/current/all_time_since_today?project=${encodeURIComponent(projectName)}`;
+    // Wakatime only; Hackatime callers fall back to the daily sum.
+    if (this.provider !== "wakatime") return null;
+    const url = `${WAKATIME_BASE}/users/current/all_time_since_today?project=${encodeURIComponent(
+      projectName
+    )}`;
     const res = await this.get(url);
-    if (!res.ok) return null;
+    if (!res?.ok) return null;
     const body = await res.json();
     const raw = body?.data?.total_seconds;
     if (raw == null) return null;
@@ -78,11 +110,13 @@ class TimeTrackerClient {
   async getDailyBreakdown(projectName, days = LOOKBACK_DAYS) {
     const end = new Date();
     const start = new Date(end.getTime() - days * 86400000);
-    const url = `/users/current/summaries?start=${isoDate(start)}&end=${isoDate(end)}`;
+    const url = `${this.#summariesBase()}/users/current/summaries?start=${isoDate(
+      start
+    )}&end=${isoDate(end)}`;
     let entries;
     try {
       const res = await this.get(url);
-      if (!res.ok) return { daily: [], languages: [] };
+      if (!res?.ok) return { daily: [], languages: [] };
       const body = await res.json();
       entries = Array.isArray(body?.data) ? body.data : [];
     } catch {
@@ -139,13 +173,53 @@ class TimeTrackerClient {
     };
   }
 
-  get(path) {
-    return fetch(`${this.base}${path}`, {
-      headers: {
-        Authorization: `Basic ${Buffer.from(this.key).toString("base64")}`,
-        "User-Agent": "skillhive-sync/1.0",
-      },
-    });
+  /** Try each auth scheme until one answers OK; lock it in for the session. */
+  async get(url) {
+    const schemes = this.resolvedScheme ? [this.resolvedScheme] : this.schemes;
+    const failures = [];
+
+    for (const authorization of schemes) {
+      try {
+        const res = await fetch(url, {
+          headers: { Authorization: authorization, "User-Agent": "skillhive-sync/1.0" },
+        });
+        if (res.ok) {
+          this.resolvedScheme = authorization;
+          this.lastErrorDetail = null;
+          return res;
+        }
+        failures.push(`${res.status} via ${this.masked(authorization)}`);
+      } catch (err) {
+        failures.push(`network error via ${this.masked(authorization)}: ${err?.message}`);
+      }
+    }
+    this.lastErrorDetail = failures.join("; ");
+    return null;
+  }
+
+  #summariesBase() {
+    return this.provider === "hackatime" ? HACKATIME_COMPAT_BASE : WAKATIME_BASE;
+  }
+
+  masked(authorization) {
+    return authorization.startsWith("Bearer") ? "Bearer …" : "Basic …";
+  }
+
+  async projectNamesFromSummaries() {
+    const end = new Date();
+    const start = new Date(end.getTime() - LOOKBACK_DAYS * 86400000);
+    const res = await this.get(
+      `${this.#summariesBase()}/users/current/summaries?start=${isoDate(start)}&end=${isoDate(end)}`
+    );
+    if (!res?.ok) return [];
+    const body = await res.json();
+    const names = new Set();
+    for (const entry of body?.data ?? []) {
+      for (const p of entry.projects ?? []) {
+        if (p.name) names.add(p.name);
+      }
+    }
+    return [...names];
   }
 }
 
@@ -157,8 +231,14 @@ function isoDate(d) {
 
 async function syncConnection(conn) {
   try {
-    const client = new TimeTrackerClient(conn.provider, conn.api_key);
-    if (!(await client.testConnection())) throw new Error("api key rejected by tracker");
+    const client = new TimeTrackerClient(conn.provider, String(conn.api_key ?? "").trim());
+    if (!(await client.testConnection())) {
+      throw new Error(
+        `api key rejected by ${conn.provider} tracker${
+          client.lastErrorDetail ? ` (${client.lastErrorDetail})` : ""
+        }`
+      );
+    }
 
     const projects = await client.listProjects();
     let synced = 0;
@@ -211,11 +291,20 @@ async function syncConnection(conn) {
   }
 }
 
-async function loadConnections(userId) {
+/**
+ * @param {string|null} userId  restrict to one user (manual sync)
+ * @param {boolean} includeErrored  manual retries must see failed connections,
+ * otherwise an errored row can never be synced again (stuck-state bug).
+ */
+async function loadConnections(userId, includeErrored = false) {
   let query = supabaseAdmin
     .from("time_tracker_connections")
-    .select("user_id, provider, api_key, last_sync_at")
-    .eq("status", "active");
+    .select("user_id, provider, api_key, last_sync_at");
+  if (includeErrored) {
+    query = query.in("status", ["active", "error"]);
+  } else {
+    query = query.eq("status", "active");
+  }
   if (userId) query = query.eq("user_id", userId);
   const { data, error } = await query;
   if (error) throw new Error(error.message);
@@ -226,7 +315,12 @@ async function syncAllConnections() {
   const connections = await loadConnections(null);
   const results = [];
   for (const conn of connections) {
-    results.push(await syncConnection(conn));
+    const result = await syncConnection(conn);
+    console.log(
+      `[timeTracker] cron sync user=${conn.user_id} provider=${conn.provider} ` +
+        (result.ok ? "ok" : `FAILED: ${result.error}`)
+    );
+    results.push(result);
   }
   return results;
 }
@@ -254,7 +348,8 @@ async function handleManualSync(req, res) {
     if (authError || !user) return res.status(401).json({ error: "invalid session" });
 
     const force = req.query.force === "1";
-    const connections = await loadConnections(user.id);
+    // includeErrored: a previously-failed connection must be retryable here.
+    const connections = await loadConnections(user.id, true);
     if (connections.length === 0) {
       return res.status(200).json({ synced: 0, results: [] });
     }
@@ -265,7 +360,14 @@ async function handleManualSync(req, res) {
         results.push({ user_id: conn.user_id, ok: false, skipped: true });
         continue;
       }
-      results.push(await syncConnection(conn));
+      const result = await syncConnection(conn);
+      console.log(
+        `[timeTracker] manual sync user=${conn.user_id} provider=${conn.provider} ` +
+          (result.ok
+            ? `ok projects=${result.projects_synced}`
+            : `FAILED: ${result.error}`)
+      );
+      results.push(result);
     }
 
     res.json({
@@ -278,4 +380,4 @@ async function handleManualSync(req, res) {
   }
 }
 
-module.exports = { initTimeTrackerSync, handleManualSync };
+module.exports = { initTimeTrackerSync, handleManualSync, TimeTrackerClient };
