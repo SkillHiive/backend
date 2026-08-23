@@ -229,14 +229,30 @@ function isoDate(d) {
 
 // ── Sync orchestration ──────────────────────────────────────────────────────
 
+/** Normalise pasted keys: trim, strip wrapping quotes, drop internal whitespace. */
+function sanitizeApiKey(raw) {
+  return String(raw ?? "")
+    .replace(/^["'`\s]+|["'`\s]+$/g, "")
+    .replace(/\s+/g, "");
+}
+
+function maskKey(key) {
+  if (!key) return "(empty)";
+  return `${key.slice(0, 4)}…${key.slice(-4)} (len=${key.length})`;
+}
+
 async function syncConnection(conn) {
   try {
-    const client = new TimeTrackerClient(conn.provider, String(conn.api_key ?? "").trim());
+    const apiKey = sanitizeApiKey(conn.api_key);
+    console.log(
+      `[timeTracker] syncing user=${conn.user_id} provider=${conn.provider} key=${maskKey(apiKey)}`
+    );
+    const client = new TimeTrackerClient(conn.provider, apiKey);
     if (!(await client.testConnection())) {
       throw new Error(
-        `api key rejected by ${conn.provider} tracker${
-          client.lastErrorDetail ? ` (${client.lastErrorDetail})` : ""
-        }`
+        `api key rejected by ${conn.provider} tracker [stored ${maskKey(
+          apiKey
+        )}]${client.lastErrorDetail ? ` (${client.lastErrorDetail})` : ""}`
       );
     }
 
