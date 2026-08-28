@@ -23,6 +23,10 @@ app.post("/sync-time-trackers", handleManualSync);
 
 const PORT = 3000;
 
+app.get("/health", (req, res) => {
+  res.status(200).json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
 app.get("/getToken", async (req, res) => {
   try {
     if (req.method === "OPTIONS") {
