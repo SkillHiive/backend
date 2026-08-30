@@ -8,6 +8,20 @@ const {
   handleManualSync,
 } = require("./timeTrackerSync");
 
+const requiredEnvVars = [
+  "SUPABASE_URL",
+  "SUPABASE_SERVICE_ROLE_KEY",
+  "LIVEKIT_API_KEY",
+  "LIVEKIT_API_SECRET",
+];
+
+for (const envVar of requiredEnvVars) {
+  if (!process.env[envVar]) {
+    console.error(`Missing required environment variable: ${envVar}`);
+    process.exit(1);
+  }
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -18,13 +32,71 @@ const supabase = createClient(
 );
 
 // Time-tracker sync engine (Wakatime/Hackatime): manual endpoint + daily cron.
-initTimeTrackerSync(supabase);
+const cleanupTimeTracker = initTimeTrackerSync(supabase);
 app.post("/sync-time-trackers", handleManualSync);
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
+let server;
+
+function createServer() {
+  return app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://0.0.0.0:${PORT}`);
+  });
+}
+
+function gracefulShutdown(signal) {
+  console.log(`Received ${signal}. Starting graceful shutdown...`);
+  
+  if (cleanupTimeTracker) {
+    try {
+      cleanupTimeTracker();
+      console.log('Time tracker cron stopped');
+    } catch (err) {
+      console.error('Error stopping time tracker cron:', err);
+    }
+  }
+  
+  if (server) {
+    server.close((err) => {
+      if (err) {
+        console.error('Error during server close:', err);
+        process.exit(1);
+      }
+      console.log('Server closed. Exiting process.');
+      process.exit(0);
+    });
+
+    setTimeout(() => {
+      console.error('Forced shutdown after timeout');
+      process.exit(1);
+    }, 10000);
+  } else {
+    process.exit(0);
+  }
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+  gracefulShutdown('uncaughtException');
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+server = createServer();
 
 app.get("/health", (req, res) => {
-  res.status(200).json({ status: "ok", timestamp: new Date().toISOString() });
+  res.status(200).json({ 
+    status: "ok", 
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    pid: process.pid
+  });
 });
 
 app.get("/getToken", async (req, res) => {
@@ -86,8 +158,4 @@ app.get("/getToken", async (req, res) => {
     console.error(err);
     res.status(500).json({ error: "failed to generate token" });
   }
-});
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running on http://0.0.0:${PORT}`);
 });

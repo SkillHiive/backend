@@ -1,15 +1,16 @@
 // Time-tracker sync engine (Wakatime + Hackatime) for SkillHive.
 //
-// Runs inside the existing Express server:
-//   POST /sync-time-trackers          — per-user manual sync (Supabase JWT auth,
-//                                       5-min debounce unless ?force=1)
-//   internal daily tick @ 03:00 UTC   — syncs every active connection
-//
-// Replaces the hosted-Supabase Edge Function variant for self-hosted deploys.
+ // Runs inside the existing Express server:
+ //   POST /sync-time-trackers          — per-user manual sync (Supabase JWT auth,
+ //                                       5-min debounce unless ?force=1)
+ //   internal daily tick @ 03:00 UTC   — syncs every active connection
+ //
+ // Replaces the hosted-Supabase Edge Function variant for self-hosted deploys.
 
 const LOOKBACK_DAYS = 90;
 const MANUAL_DEBOUNCE_MS = 5 * 60 * 1000;
 const CRON_HOUR_UTC = 3;
+const FETCH_TIMEOUT_MS = 30000;
 
 let supabaseAdmin = null;
 let lastCronDay = null;
@@ -24,11 +25,27 @@ function initTimeTrackerSync(adminClient) {
     const day = now.toISOString().slice(0, 10);
     if (now.getUTCHours() === CRON_HOUR_UTC && lastCronDay !== day) {
       lastCronDay = day;
-      syncAllConnections().catch((err) =>
-        console.error("[timeTracker] daily sync failed:", err.message)
-      );
+      syncAllConnections()
+        .then((results) => {
+          const failed = results.filter((r) => !r.ok).length;
+          if (failed > 0) {
+            console.warn(`[timeTracker] daily sync completed with ${failed} failures`);
+          } else {
+            console.log(`[timeTracker] daily sync completed successfully for ${results.length} connections`);
+          }
+        })
+        .catch((err) =>
+          console.error("[timeTracker] daily sync failed:", err.message)
+        );
     }
   }, 60 * 1000);
+
+  return () => {
+    if (cronTimer) {
+      clearInterval(cronTimer);
+      cronTimer = null;
+    }
+  };
 }
 
 // ── Unified tracker client ──────────────────────────────────────────────────
@@ -180,9 +197,16 @@ class TimeTrackerClient {
 
     for (const authorization of schemes) {
       try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+        
         const res = await fetch(url, {
           headers: { Authorization: authorization, "User-Agent": "skillhive-sync/1.0" },
+          signal: controller.signal,
         });
+        
+        clearTimeout(timeoutId);
+        
         if (res.ok) {
           this.resolvedScheme = authorization;
           this.lastErrorDetail = null;
@@ -190,7 +214,11 @@ class TimeTrackerClient {
         }
         failures.push(`${res.status} via ${this.masked(authorization)}`);
       } catch (err) {
-        failures.push(`network error via ${this.masked(authorization)}: ${err?.message}`);
+        if (err.name === 'AbortError') {
+          failures.push(`timeout via ${this.masked(authorization)}`);
+        } else {
+          failures.push(`network error via ${this.masked(authorization)}: ${err?.message}`);
+        }
       }
     }
     this.lastErrorDetail = failures.join("; ");
