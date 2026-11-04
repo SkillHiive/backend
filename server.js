@@ -1,12 +1,19 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const { AccessToken } = require("livekit-server-sdk");
 const { createClient } = require("@supabase/supabase-js");
+const { AccessToken } = require("livekit-server-sdk");
+const crypto = require("crypto");
+
 const {
   initTimeTrackerSync,
   handleManualSync,
 } = require("./timeTrackerSync");
+
+const { rateLimitToken, rateLimitSync, rateLimitGetToken } = require("./src/middleware/rateLimit");
+const { metricsMiddleware, register, recordSyncDuration, setActiveConnections } = require("./src/metrics");
+const { logger } = require("./src/logger");
+const { setupCueSyncProxy } = require("./src/proxy/cueSync");
 
 const requiredEnvVars = [
   "SUPABASE_URL",
@@ -17,57 +24,60 @@ const requiredEnvVars = [
 
 for (const envVar of requiredEnvVars) {
   if (!process.env[envVar]) {
-    console.error(`Missing required environment variable: ${envVar}`);
+    logger.error(`Missing required environment variable: ${envVar}`);
     process.exit(1);
   }
 }
 
 const app = express();
+
 app.use(cors());
 app.use(express.json());
+app.use(metricsMiddleware);
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// Time-tracker sync engine (Wakatime/Hackatime): manual endpoint + daily cron.
 const cleanupTimeTracker = initTimeTrackerSync(supabase);
-app.post("/sync-time-trackers", handleManualSync);
+app.post("/sync-time-trackers", rateLimitSync, handleManualSync);
+
+setupCueSyncProxy(app, supabase);
 
 const PORT = process.env.PORT || 3000;
 let server;
 
 function createServer() {
   return app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
+    logger.info(`Server running on http://0.0.0.0:${PORT}`);
   });
 }
 
 function gracefulShutdown(signal) {
-  console.log(`Received ${signal}. Starting graceful shutdown...`);
-  
+  logger.info(`Received ${signal}. Starting graceful shutdown...`);
+
   if (cleanupTimeTracker) {
     try {
       cleanupTimeTracker();
-      console.log('Time tracker cron stopped');
+      logger.info('Time tracker cron stopped');
     } catch (err) {
-      console.error('Error stopping time tracker cron:', err);
+      logger.error('Error stopping time tracker cron', { error: err.message });
     }
   }
-  
+
   if (server) {
     server.close((err) => {
       if (err) {
-        console.error('Error during server close:', err);
+        logger.error('Error during server close', { error: err.message });
         process.exit(1);
       }
-      console.log('Server closed. Exiting process.');
+      logger.info('Server closed. Exiting process.');
       process.exit(0);
     });
 
     setTimeout(() => {
-      console.error('Forced shutdown after timeout');
+      logger.error('Forced shutdown after timeout');
       process.exit(1);
     }, 10000);
   } else {
@@ -79,27 +89,41 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 process.on('uncaughtException', (err) => {
-  console.error('Uncaught Exception:', err);
+  logger.error('Uncaught Exception', { error: err.message, stack: err.stack });
   gracefulShutdown('uncaughtException');
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  logger.error('Unhandled Rejection', { reason: String(reason) });
 });
 
-server = createServer();
+app.get("/health", async (req, res) => {
+  try {
+    const checks = await Promise.allSettled([
+      supabase.from('profiles').select('id').limit(1),
+    ]);
 
-app.get("/health", (req, res) => {
-  res.status(200).json({ 
-    status: "ok", 
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    memory: process.memoryUsage(),
-    pid: process.pid
-  });
+    const db = checks[0].status === 'fulfilled' && checks[0].value;
+
+    res.status(db ? 200 : 503).json({
+      ok: db,
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime(),
+      memory: process.memoryUsage(),
+      pid: process.pid,
+      dependencies: { database: db },
+    });
+  } catch (err) {
+    res.status(503).json({ ok: false, error: err.message });
+  }
 });
 
-app.get("/getToken", async (req, res) => {
+app.get("/metrics", async (req, res) => {
+  res.set('Content-Type', register.contentType);
+  res.send(await register.metrics());
+});
+
+app.get("/getToken", rateLimitGetToken, async (req, res) => {
   try {
     if (req.method === "OPTIONS") {
       return res.sendStatus(200);
@@ -153,9 +177,10 @@ app.get("/getToken", async (req, res) => {
 
     const token = await at.toJwt();
     res.json({ token });
-
   } catch (err) {
-    console.error(err);
+    logger.error("getToken error", { error: err.message });
     res.status(500).json({ error: "failed to generate token" });
   }
 });
+
+server = createServer();
