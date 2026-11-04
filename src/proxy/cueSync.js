@@ -1,6 +1,6 @@
 /**
  * Cue Sync Proxy for SkillHive Backend
- * Proxies Cue push requests to Backstage
+ * Proxies Cue push/pull requests to Backstage
  */
 
 const { createClient } = require('@supabase/supabase-js');
