@@ -11,7 +11,7 @@
     "pm2:restart": "pm2 restart all",
     "pm2:delete": "pm2 delete all",
     "dev": "node --watch server.js",
-    "test": "echo \"No tests yet\" && exit 1"
+    "test": "node --test test/"
   },
   "keywords": [],
   "author": "",

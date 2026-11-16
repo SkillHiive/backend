@@ -2,7 +2,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { createClient } = require("@supabase/supabase-js");
-const { AccessToken } = require("livekit-server-sdk");
+const { AccessToken, RoomServiceClient } = require("livekit-server-sdk");
 const crypto = require("crypto");
 
 const {
@@ -14,6 +14,7 @@ const { rateLimitToken, rateLimitSync, rateLimitGetToken } = require("./src/midd
 const { metricsMiddleware, register, recordSyncDuration, setActiveConnections } = require("./src/metrics");
 const { logger } = require("./src/logger");
 const { setupCueSyncProxy } = require("./src/proxy/cueSync");
+const rooms = require("./src/rooms");
 
 const requiredEnvVars = [
   "SUPABASE_URL",
@@ -123,63 +124,58 @@ app.get("/metrics", async (req, res) => {
   res.send(await register.metrics());
 });
 
-app.get("/getToken", rateLimitGetToken, async (req, res) => {
+// LiveKit room service: creates rooms with a participant cap and lists who is inside.
+const livekit = new RoomServiceClient(
+  process.env.LIVEKIT_URL || "https://rooms.skillhiive.com",
+  process.env.LIVEKIT_API_KEY,
+  process.env.LIVEKIT_API_SECRET
+);
+
+async function issueToken(identity, room) {
+  const at = new AccessToken(process.env.LIVEKIT_API_KEY, process.env.LIVEKIT_API_SECRET, { identity });
+  at.addGrant({ roomJoin: true, room, canPublish: true, canSubscribe: true });
+  return at.toJwt();
+}
+
+const roomDeps = () => ({
+  supabase,
+  livekit,
+  issueToken,
+  now: () => Date.now(),
+  cap: rooms.roomCap(process.env.ROOM_CAP),
+  randomHex: (bytes) => crypto.randomBytes(bytes).toString("hex"),
+});
+
+function send(res, result) {
+  res.status(result.status).json(result.body);
+}
+
+// POST { room } is the way to ask. GET ?room= stays for one release; a username in either is ignored.
+app.post("/getToken", rateLimitGetToken, async (req, res) => {
   try {
-    if (req.method === "OPTIONS") {
-      return res.sendStatus(200);
-    }
-
-    const room = req.query.room;
-    const username = req.query.username;
-
-    if (!room || !username) {
-      return res.status(400).json({ error: "room and username are required" });
-    }
-
-    const authHeader = req.headers.authorization;
-    if (!authHeader) {
-      return res.status(401).json({ error: "unauthorized" });
-    }
-
-    const sessionToken = authHeader.replace("Bearer ", "");
-    const { data: { user }, error: authError } = await supabase.auth.getUser(sessionToken);
-
-    if (authError || !user) {
-      return res.status(401).json({ error: "invalid session" });
-    }
-
-    const { data: profile, error: profileError } = await supabase
-      .from("profiles")
-      .select("username")
-      .eq("id", user.id)
-      .single();
-
-    if (profileError || !profile) {
-      return res.status(401).json({ error: "profile not found" });
-    }
-
-    if (profile.username !== username) {
-      return res.status(403).json({ error: "username mismatch" });
-    }
-
-    const at = new AccessToken(
-      process.env.LIVEKIT_API_KEY,
-      process.env.LIVEKIT_API_SECRET,
-      { identity: username }
-    );
-
-    at.addGrant({
-      roomJoin: true,
-      room,
-      canPublish: true,
-      canSubscribe: true,
-    });
-
-    const token = await at.toJwt();
-    res.json({ token });
+    send(res, await rooms.getToken({ ...roomDeps(), authHeader: req.headers.authorization, room: req.body && req.body.room }));
   } catch (err) {
     logger.error("getToken error", { error: err.message });
     res.status(500).json({ error: "failed to generate token" });
+  }
+});
+
+app.get("/getToken", rateLimitGetToken, async (req, res) => {
+  try {
+    send(res, await rooms.getToken({ ...roomDeps(), authHeader: req.headers.authorization, room: req.query.room }));
+  } catch (err) {
+    logger.error("getToken error", { error: err.message });
+    res.status(500).json({ error: "failed to generate token" });
+  }
+});
+
+app.post("/cubicle", rateLimitGetToken, async (req, res) => {
+  try {
+    const body = req.body || {};
+    send(res, await rooms.createCubicle({ ...roomDeps(), authHeader: req.headers.authorization, room: body.room, target: body.target }));
+  } catch (err) {
+    logger.error("cubicle error", { error: err.message });
+    res.status(500).json({ error: "failed to create cubicle" });
   }
 });
 

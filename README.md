@@ -77,6 +77,10 @@ SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 # LiveKit (API key/secret for token generation)
 LIVEKIT_API_KEY=your-livekit-api-key
 LIVEKIT_API_SECRET=your-livekit-api-secret
+# Where the room service lives (default https://rooms.skillhiive.com); used to create rooms with a cap
+LIVEKIT_URL=https://rooms.skillhiive.com
+# Most people allowed in one room at a time (default 12)
+ROOM_CAP=12
 ```
 
 Never commit your `.env` file or expose service credentials publicly.
@@ -100,18 +104,32 @@ The backend will start on `http://0.0.0.0:3000` (or configured `PORT`).
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
 | `GET` | `/health` | None | Health check with uptime, memory, PID |
-| `GET` | `/getToken` | Bearer (Supabase JWT) | Generate LiveKit room token |
+| `POST` | `/getToken` | Bearer (Supabase JWT) | Generate a LiveKit room token (`{ room }`) |
+| `GET` | `/getToken` | Bearer (Supabase JWT) | Same, `?room=`; kept for one release |
+| `POST` | `/cubicle` | Bearer (Supabase JWT) | Create a private two-person cubicle (`{ room, target }`) |
 | `POST` | `/sync-time-trackers` | Bearer (Supabase JWT) | Manual time-tracker sync (query `?force=1` to skip debounce) |
 
 ### `/getToken` — LiveKit Room Token
 
-**Query params:** `room` (string), `username` (string)
+**Body:** `{ "room": "<room-name>" }` (the legacy `GET ?room=` still works for one release)
 
 **Headers:** `Authorization: Bearer <supabase-jwt>`
 
-**Response:** `{ "token": "<livekit-jwt>" }`
+**Response:** `{ "token": "<livekit-jwt>", "serverTime": <ms since epoch> }`
 
-Validates the Supabase session, confirms the username matches the authenticated user's profile, then issues a LiveKit access token with `roomJoin`, `canPublish`, and `canSubscribe` grants.
+The identity is always the profile username of the signed-in user; a `username` sent by the client is ignored. Room names must match `^[a-z0-9][a-z0-9-]{1,62}$` (or be a cubicle name), otherwise `400`.
+
+Before issuing a token the server creates the room in LiveKit with `maxParticipants = ROOM_CAP` (creating an existing room is a no-op), so LiveKit itself refuses a join past the cap. If the room is already at the cap and the caller is not inside it, the answer is `409 { "error": "room_full" }`; someone already inside may re-join. `serverTime` lets the web app keep a shared clock.
+
+For a cubicle room (`cub_` plus 24 hex characters) a token is issued only when the caller is one of the two members named when the cubicle was created, otherwise `403`.
+
+### `/cubicle` — Private two-person room
+
+**Body:** `{ "room": "<room-name>", "target": "<username>" }`
+
+**Response:** `{ "cubicleRoomName": "cub_…", "token": "<livekit-jwt>", "serverTime": <ms> }`
+
+The caller and the target must both be inside `room` (`403` otherwise). The server picks the name, creates the cubicle with `maxParticipants: 2`, `emptyTimeout: 60` and the two usernames as room metadata, and returns the caller's token. The invited person then calls `/getToken` with the cubicle name. Both routes keep the existing per-IP rate limiter.
 
 ### `/sync-time-trackers` — Time Tracker Sync
 
